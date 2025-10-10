@@ -550,6 +550,7 @@ fn create_parent_dirs(
     for c in parent_path.components() {
         // Ensure that the name is a normal entry of the current dir_path.
         dir_path.push(c.to_fs_name().map_err(|err| err.with_path(repo_path))?);
+
         // A directory named ".git" or ".jj" can be temporarily created. It
         // might trick workspace path discovery, but is harmless so long as the
         // directory is empty.
@@ -622,16 +623,16 @@ fn can_create_new_file(disk_path: &Path) -> Result<bool, CheckoutError> {
     // name ".git" or ".jj", git/jj CLI could be tricked to load configuration
     // from an attacker-controlled location. So we first test the path by
     // creating an empty file.
-    let new_file_created = match OpenOptions::new()
+    let new_file = match OpenOptions::new()
         .write(true)
         .create_new(true) // Don't overwrite, don't follow symlink
         .open(disk_path)
     {
-        Ok(_) => true,
-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => false,
+        Ok(file) => Some(file),
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => None,
         // Workaround for "Access is denied. (os error 5)" error on Windows.
         Err(_) => match disk_path.symlink_metadata() {
-            Ok(_) => false,
+            Ok(_) => None,
             Err(err) => {
                 return Err(CheckoutError::Other {
                     message: format!("Failed to stat {}", disk_path.display()),
@@ -640,47 +641,109 @@ fn can_create_new_file(disk_path: &Path) -> Result<bool, CheckoutError> {
             }
         },
     };
-    reject_reserved_existing_path(disk_path).inspect_err(|_| {
-        if new_file_created {
-            fs::remove_file(disk_path).ok();
-        }
-    })?;
-    if new_file_created {
+
+    let new_file_created = new_file.is_some();
+
+    if let Some(new_file) = new_file {
+        reject_reserved_existing_file(new_file, disk_path).inspect_err(|_| {
+            // We keep the error from `reject_reserved_existing_file`
+            let _ = fs::remove_file(disk_path);
+        })?;
+
         fs::remove_file(disk_path).map_err(|err| CheckoutError::Other {
             message: format!("Failed to remove temporary file {}", disk_path.display()),
             err: err.into(),
         })?;
+    } else {
+        reject_reserved_existing_path(disk_path)?;
     }
+
     Ok(new_file_created)
 }
 
 const RESERVED_DIR_NAMES: &[&str] = &[".git", ".jj"];
 
+/// Maps the result from constructing a `same_file::Handle` so that
+/// we get either an `Option<same_file::Handle>` which may be `None`
+/// if the file doesn't exist, or a `CheckoutError` indicating the
+/// error encountered when attempting to construct the `Handle`
+fn map_samefile_result(
+    disk_path: &Path,
+    result: std::io::Result<same_file::Handle>,
+) -> Result<Option<same_file::Handle>, CheckoutError> {
+    match result {
+        Ok(val) => Ok(Some(val)),
+        // If the existing disk_path pointed to the reserved path, the
+        // reserved path would exist.
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(CheckoutError::Other {
+            message: format!("Failed to validate path {}", disk_path.display()),
+            err: err.into(),
+        }),
+    }
+}
+
+/// Wrapper for [`reject_reserved_existing_handle`] which avoids a syscall
+/// by converting the provided `file` to a `same_file::Handle` via its
+/// file descriptor.
+///
+/// See [`reject_reserved_existing_handle`] for more info.
+fn reject_reserved_existing_file(file: File, disk_path: &Path) -> Result<(), CheckoutError> {
+    let Some(file_handle) = map_samefile_result(disk_path, same_file::Handle::from_file(file))?
+    else {
+        return Ok(());
+    };
+
+    reject_reserved_existing_handle(file_handle, disk_path)
+}
+
+/// Wrapper for [`reject_reserved_existing_handle`] which converts
+/// the provided `disk_path` to a `same_file::Handle`.
+///
+/// See [`reject_reserved_existing_handle`] for more info.
+///
+/// # Remarks
+///
+/// Incurs an additional syscall cost to open and close the file
+/// descriptor/`HANDLE` for `disk_path`.
+fn reject_reserved_existing_path(disk_path: &Path) -> Result<(), CheckoutError> {
+    let Some(disk_handle) =
+        map_samefile_result(disk_path, same_file::Handle::from_path(disk_path))?
+    else {
+        return Ok(());
+    };
+
+    reject_reserved_existing_handle(disk_handle, disk_path)
+}
+
 /// Suppose the `disk_path` exists, checks if the last component points to
 /// ".git" or ".jj" in the same parent directory.
-fn reject_reserved_existing_path(disk_path: &Path) -> Result<(), CheckoutError> {
+///
+/// # Remarks
+///
+/// Incurs a syscall cost to open and close a file descriptor/`HANDLE` for
+/// each filename in `RESERVED_DIR_NAMES`.
+fn reject_reserved_existing_handle(
+    disk_handle: same_file::Handle,
+    disk_path: &Path,
+) -> Result<(), CheckoutError> {
     let parent_dir_path = disk_path.parent().expect("content path shouldn't be root");
     for name in RESERVED_DIR_NAMES {
         let reserved_path = parent_dir_path.join(name);
-        match same_file::is_same_file(disk_path, &reserved_path) {
-            Ok(true) => {
-                return Err(CheckoutError::ReservedPathComponent {
-                    path: disk_path.to_owned(),
-                    name,
-                });
-            }
-            Ok(false) => {}
-            // If the existing disk_path pointed to the reserved path, the
-            // reserved path would exist.
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(CheckoutError::Other {
-                    message: format!("Failed to validate path {}", disk_path.display()),
-                    err: err.into(),
-                });
-            }
+        let Some(reserved_handle) =
+            map_samefile_result(disk_path, same_file::Handle::from_path(reserved_path))?
+        else {
+            continue;
+        };
+
+        if disk_handle == reserved_handle {
+            return Err(CheckoutError::ReservedPathComponent {
+                path: disk_path.to_owned(),
+                name,
+            });
         }
     }
+
     Ok(())
 }
 
@@ -1883,6 +1946,10 @@ impl TreeState {
                 Err(err) => (path, Err(err)),
             })
             .buffered(self.store.concurrency().max(1));
+
+        let mut prev_created_path: Option<PathBuf> = None;
+        let mut path_prefix = PathBuf::new();
+
         while let Some((path, data)) = diff_stream.next().await {
             let (before, after) = data?;
             if after.is_absent() {
@@ -1909,13 +1976,73 @@ impl TreeState {
                 continue;
             }
 
+            // Temporary so that `path_stripped_prefix` an remain a reference
+            let temp_prev_created_path = prev_created_path.take();
+            let this_path = path.to_fs_path(self.working_copy_path())?;
+
+            let adjusted_working_copy_path = if let Some(ref prev_path) = temp_prev_created_path {
+                // Obtain the common prefix between these paths
+                path_prefix.clear();
+
+                for (prev_comp, this_comp) in prev_path.components().zip(this_path.components()) {
+                    if prev_comp == this_comp {
+                        path_prefix.push(prev_comp);
+                    } else {
+                        break;
+                    }
+                }
+
+                &path_prefix
+            } else {
+                &self.working_copy_path
+            };
+
+            // Calculate the repo path that corresponds to adjusted_working_copy_path. At
+            // this point the `repo_path` has a prefix which is already included
+            // in `adjusted_working_copy_path`
+            let adjusted_diff_file_path = if temp_prev_created_path.is_some() {
+                let common_repo_prefix = path_prefix
+                    .strip_prefix(&self.working_copy_path)
+                    .expect("path_prefix should start with working_copy_path");
+
+                let common_repo_prefix = RepoPathBuf::from_relative_path(common_repo_prefix)
+                    .expect("common prefix should be valid repo path");
+
+                path.strip_prefix(&common_repo_prefix)
+                    .expect("path should start with common prefix")
+            } else {
+                path.as_ref()
+            };
+
             // Create parent directories no matter if after.is_present(). This
             // ensures that the path never traverses symlinks.
-            let Some(disk_path) = create_parent_dirs(&self.working_copy_path, &path)? else {
-                changed_file_states.push((path, FileState::placeholder()));
-                stats.skipped_files += 1;
-                continue;
+            let disk_path = if adjusted_diff_file_path.is_root() {
+                // the path being "root" here implies that we had already processed a path like:
+                // "foo/bar/baz"
+                //
+                // and this path is:
+                // "foo/bar"
+                //
+                // and now this path has been converted to an empty string since its entire
+                // prefix has already been created. This means that we _dont_ need to
+                // create its parent dirs either.
+
+                this_path
+            } else {
+                // Cache this path for the next iteration.
+                prev_created_path = Some(this_path);
+
+                let Some(disk_path) =
+                    create_parent_dirs(adjusted_working_copy_path, adjusted_diff_file_path)?
+                else {
+                    changed_file_states.push((path, FileState::placeholder()));
+                    stats.skipped_files += 1;
+                    continue;
+                };
+
+                disk_path
             };
+
             // If the path was present, check reserved path first and delete it.
             let present_file_deleted = before.is_present() && remove_old_file(&disk_path)?;
             // If not, create temporary file to test the path validity.
@@ -1928,11 +2055,17 @@ impl TreeState {
             // TODO: Check that the file has not changed before overwriting/removing it.
             let file_state = match after {
                 MaterializedTreeValue::Absent | MaterializedTreeValue::AccessDenied(_) => {
+                    // Reset the previous path to avoid scenarios where this path is deleted,
+                    // then on the next iteration recreation is skipped because of this
+                    // optimization.
+                    prev_created_path.take();
+
                     let mut parent_dir = disk_path.parent().unwrap();
                     loop {
                         if fs::remove_dir(parent_dir).is_err() {
                             break;
                         }
+
                         parent_dir = parent_dir.parent().unwrap();
                     }
                     deleted_files.insert(path);
