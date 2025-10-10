@@ -542,6 +542,7 @@ fn sparse_patterns_from_proto(
 fn create_parent_dirs(
     working_copy_path: &Path,
     repo_path: &RepoPath,
+    reserved_path_cache: &mut HashSet<PathBuf>,
 ) -> Result<Option<PathBuf>, CheckoutError> {
     let (parent_path, basename) = repo_path.split().expect("repo path shouldn't be root");
     let mut dir_path = working_copy_path.to_owned();
@@ -571,7 +572,7 @@ fn create_parent_dirs(
         };
         // Invalid component (e.g. "..") should have been rejected.
         // The current dir_path should be an entry of dir_path.parent().
-        reject_reserved_existing_path(&dir_path).inspect_err(|_| {
+        reject_reserved_existing_path(&dir_path, reserved_path_cache).inspect_err(|_| {
             if new_dir_created {
                 fs::remove_dir(&dir_path).ok();
             }
@@ -593,7 +594,8 @@ fn create_parent_dirs(
 /// If the existing file points to ".git" or ".jj", this function returns an
 /// error.
 fn remove_old_file(disk_path: &Path) -> Result<bool, CheckoutError> {
-    reject_reserved_existing_path(disk_path)?;
+    let mut empty_cache = HashSet::new();
+    reject_reserved_existing_path(disk_path, &mut empty_cache)?;
     match fs::remove_file(disk_path) {
         Ok(()) => Ok(true),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
@@ -632,6 +634,7 @@ enum CreateNewFileResult {
 fn can_create_new_file(
     delete_file: bool,
     disk_path: &Path,
+    reserved_path_cache: &mut HashSet<PathBuf>,
 ) -> Result<CreateNewFileResult, CheckoutError> {
     // New file or symlink will be created by caller. If it were pointed to by
     // name ".git" or ".jj", git/jj CLI could be tricked to load configuration
@@ -660,7 +663,7 @@ fn can_create_new_file(
         // Try to clone this descriptor. If it fails, the caller will account for it.
         let mut return_file = new_file.try_clone().ok();
 
-        let reject_result = reject_reserved_existing_file(new_file, disk_path);
+        let reject_result = reject_reserved_existing_file(new_file, disk_path, reserved_path_cache);
         if reject_result.is_err() || delete_file {
             // Ensure there are no more open file descriptors for this file
             let _ = return_file.take();
@@ -682,7 +685,7 @@ fn can_create_new_file(
 
         Ok(CreateNewFileResult::Created(return_file))
     } else {
-        reject_reserved_existing_path(disk_path)?;
+        reject_reserved_existing_path(disk_path, reserved_path_cache)?;
 
         Ok(CreateNewFileResult::AlreadyExists)
     }
@@ -703,7 +706,15 @@ fn same_file_handle_from_path(disk_path: &Path) -> io::Result<Option<same_file::
 /// file descriptor.
 ///
 /// See [`reject_reserved_existing_handle`] for more info.
-fn reject_reserved_existing_file(file: File, disk_path: &Path) -> Result<(), CheckoutError> {
+fn reject_reserved_existing_file(
+    file: File,
+    disk_path: &Path,
+    reserved_path_cache: &mut HashSet<PathBuf>,
+) -> Result<(), CheckoutError> {
+    if can_skip_reject_reserved(disk_path, reserved_path_cache) {
+        return Ok(());
+    }
+
     // Note: since the file is open, we don't expect that it's possible for
     // `io::ErrorKind::NotFound` to be a possible error returned here.
     let file_handle = same_file::Handle::from_file(file).map_err(|err| CheckoutError::Other {
@@ -711,7 +722,7 @@ fn reject_reserved_existing_file(file: File, disk_path: &Path) -> Result<(), Che
         err: err.into(),
     })?;
 
-    reject_reserved_existing_handle(file_handle, disk_path)
+    reject_reserved_existing_handle(file_handle, disk_path, reserved_path_cache)
 }
 
 /// Wrapper for [`reject_reserved_existing_handle`] which converts
@@ -723,7 +734,14 @@ fn reject_reserved_existing_file(file: File, disk_path: &Path) -> Result<(), Che
 ///
 /// Incurs an additional syscall cost to open and close the file
 /// descriptor/`HANDLE` for `disk_path`.
-fn reject_reserved_existing_path(disk_path: &Path) -> Result<(), CheckoutError> {
+fn reject_reserved_existing_path(
+    disk_path: &Path,
+    reserved_path_cache: &mut HashSet<PathBuf>,
+) -> Result<(), CheckoutError> {
+    if can_skip_reject_reserved(disk_path, reserved_path_cache) {
+        return Ok(());
+    }
+
     let Some(disk_handle) =
         same_file_handle_from_path(disk_path).map_err(|err| CheckoutError::Other {
             message: format!("Failed to validate path {}", disk_path.display()),
@@ -736,7 +754,19 @@ fn reject_reserved_existing_path(disk_path: &Path) -> Result<(), CheckoutError> 
         return Ok(());
     };
 
-    reject_reserved_existing_handle(disk_handle, disk_path)
+    reject_reserved_existing_handle(disk_handle, disk_path, reserved_path_cache)
+}
+
+/// Check if we can skip the `reject_reserved_existing*` check based on
+/// the reserved paths are in the provided `reserved_path_cache`.
+///
+/// If all items are present, that means that none of those directories exist.
+fn can_skip_reject_reserved(disk_path: &Path, reserved_path_cache: &HashSet<PathBuf>) -> bool {
+    let parent_dir_path = disk_path.parent().expect("content path shouldn't be root");
+    RESERVED_DIR_NAMES.iter().all(|name| {
+        let reserved_path = parent_dir_path.join(name);
+        reserved_path_cache.contains(&reserved_path)
+    })
 }
 
 /// Suppose the `disk_path` exists, checks if the last component points to
@@ -752,10 +782,14 @@ fn reject_reserved_existing_path(disk_path: &Path) -> Result<(), CheckoutError> 
 fn reject_reserved_existing_handle(
     disk_handle: same_file::Handle,
     disk_path: &Path,
+    reserved_path_cache: &mut HashSet<PathBuf>,
 ) -> Result<(), CheckoutError> {
     let parent_dir_path = disk_path.parent().expect("content path shouldn't be root");
     for name in RESERVED_DIR_NAMES {
         let reserved_path = parent_dir_path.join(name);
+        if reserved_path_cache.contains(&reserved_path) {
+            continue;
+        }
 
         let Some(reserved_handle) =
             same_file_handle_from_path(&reserved_path).map_err(|err| CheckoutError::Other {
@@ -766,6 +800,7 @@ fn reject_reserved_existing_handle(
             // If the existing disk_path pointed to the reserved path, we would have
             // gotten a handle back. Since we got nothing, the file does not exist
             // and cannot be a reserved path name.
+            let _ = reserved_path_cache.insert(reserved_path);
             continue;
         };
 
@@ -2000,6 +2035,7 @@ impl TreeState {
             .buffered(self.store.concurrency().max(1));
 
         let mut prev_created_path: RepoPathBuf = RepoPathBuf::root();
+        let mut reserved_path_cache = HashSet::new();
 
         while let Some((path, data)) = diff_stream.next().await {
             let (before, after) = data?;
@@ -2056,8 +2092,11 @@ impl TreeState {
 
                 // Create parent directories no matter if after.is_present(). This
                 // ensures that the path never traverses symlinks.
-                let Some(disk_path) =
-                    create_parent_dirs(&adjusted_working_copy_path, adjusted_diff_file_path)?
+                let Some(disk_path) = create_parent_dirs(
+                    &adjusted_working_copy_path,
+                    adjusted_diff_file_path,
+                    &mut reserved_path_cache,
+                )?
                 else {
                     changed_file_states.push((path, FileState::placeholder()));
                     stats.skipped_files += 1;
@@ -2102,7 +2141,7 @@ impl TreeState {
                     | MaterializedTreeValue::Tree(_) => true,
                 };
 
-                match can_create_new_file(delete_file, &disk_path)? {
+                match can_create_new_file(delete_file, &disk_path, &mut reserved_path_cache)? {
                     CreateNewFileResult::Created(created_file) => {
                         new_file = created_file;
                     }
