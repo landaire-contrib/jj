@@ -120,6 +120,7 @@ use jj_lib::str_util::StringPattern;
 use jj_lib::transaction::Transaction;
 use jj_lib::view::View;
 use jj_lib::working_copy;
+use jj_lib::working_copy::CheckoutOptions;
 use jj_lib::working_copy::CheckoutStats;
 use jj_lib::working_copy::SnapshotOptions;
 use jj_lib::working_copy::SnapshotStats;
@@ -171,6 +172,7 @@ use crate::merge_tools::MergeEditor;
 use crate::merge_tools::MergeToolConfigError;
 use crate::operation_templater::OperationTemplateLanguage;
 use crate::operation_templater::OperationTemplateLanguageExtension;
+use crate::progress::update_progress;
 use crate::revset_util;
 use crate::revset_util::RevsetExpressionEvaluator;
 use crate::template_builder;
@@ -563,11 +565,16 @@ impl CommandHelper {
                     }
                     WorkingCopyFreshness::WorkingCopyStale
                     | WorkingCopyFreshness::SiblingOperation => {
+                        let progress = update_progress(ui);
+                        let options = CheckoutOptions {
+                            new_commit: &desired_wc_commit,
+                            progress: progress.as_ref().map(|x| x as _),
+                        };
                         let stats = update_stale_working_copy(
                             locked_ws,
                             repo.op_id().clone(),
                             &stale_wc_commit,
-                            &desired_wc_commit,
+                            &options,
                         )?;
                         workspace_command.print_updated_working_copy_stats(
                             ui,
@@ -1964,20 +1971,20 @@ See https://jj-vcs.github.io/jj/latest/working-copy/#stale-working-copy \
         Ok(stats)
     }
 
-    fn update_working_copy(
+    fn update_working_copy<'a>(
         &mut self,
         ui: &Ui,
         maybe_old_commit: Option<&Commit>,
-        new_commit: &Commit,
+        options: &CheckoutOptions,
     ) -> Result<(), CommandError> {
         assert!(self.may_update_working_copy);
         let stats = update_working_copy(
             &self.user_repo.repo,
             &mut self.workspace,
             maybe_old_commit,
-            new_commit,
+            options,
         )?;
-        self.print_updated_working_copy_stats(ui, maybe_old_commit, new_commit, &stats)
+        self.print_updated_working_copy_stats(ui, maybe_old_commit, options.new_commit, &stats)
     }
 
     fn print_updated_working_copy_stats(
@@ -2027,7 +2034,7 @@ See https://jj-vcs.github.io/jj/latest/working-copy/#stale-working-copy \
         }
     }
 
-    fn finish_transaction(
+    fn finish_transaction<'a>(
         &mut self,
         ui: &Ui,
         mut tx: Transaction,
@@ -2099,7 +2106,12 @@ See https://jj-vcs.github.io/jj/latest/working-copy/#stale-working-copy \
         // don't leave the working copy in a stale state.
         if self.may_update_working_copy {
             if let Some(new_commit) = &maybe_new_wc_commit {
-                self.update_working_copy(ui, maybe_old_wc_commit.as_ref(), new_commit)?;
+                let progress = update_progress(ui);
+                let options = CheckoutOptions {
+                    new_commit,
+                    progress: progress.as_ref().map(|x| x as _),
+                };
+                self.update_working_copy(ui, maybe_old_wc_commit.as_ref(), &options)?;
             } else {
                 // It seems the workspace was deleted, so we shouldn't try to
                 // update it.
@@ -2546,20 +2558,23 @@ pub fn start_repo_transaction(repo: &Arc<ReadonlyRepo>, string_args: &[String]) 
     tx
 }
 
-fn update_stale_working_copy(
+fn update_stale_working_copy<'a>(
     mut locked_ws: LockedWorkspace,
     op_id: OperationId,
     stale_commit: &Commit,
-    new_commit: &Commit,
+    options: &CheckoutOptions,
 ) -> Result<CheckoutStats, CommandError> {
     // The same check as start_working_copy_mutation(), but with the stale
     // working-copy commit.
     if stale_commit.tree_id() != locked_ws.locked_wc().old_tree_id() {
         return Err(user_error("Concurrent working copy operation. Try again."));
     }
-    let stats = locked_ws.locked_wc().check_out(new_commit).map_err(|err| {
+    let stats = locked_ws.locked_wc().check_out(options).map_err(|err| {
         internal_error_with_message(
-            format!("Failed to check out commit {}", new_commit.id().hex()),
+            format!(
+                "Failed to check out commit {}",
+                options.new_commit.id().hex()
+            ),
             err,
         )
     })?;
@@ -2812,20 +2827,23 @@ pub fn print_unmatched_explicit_paths<'a>(
     Ok(())
 }
 
-pub fn update_working_copy(
+pub fn update_working_copy<'a>(
     repo: &Arc<ReadonlyRepo>,
     workspace: &mut Workspace,
     old_commit: Option<&Commit>,
-    new_commit: &Commit,
+    options: &CheckoutOptions,
 ) -> Result<CheckoutStats, CommandError> {
     let old_tree_id = old_commit.map(|commit| commit.tree_id().clone());
     // TODO: CheckoutError::ConcurrentCheckout should probably just result in a
     // warning for most commands (but be an error for the checkout command)
     let stats = workspace
-        .check_out(repo.op_id().clone(), old_tree_id.as_ref(), new_commit)
+        .check_out(repo.op_id().clone(), old_tree_id.as_ref(), options)
         .map_err(|err| {
             internal_error_with_message(
-                format!("Failed to check out commit {}", new_commit.id().hex()),
+                format!(
+                    "Failed to check out commit {}",
+                    options.new_commit.id().hex()
+                ),
                 err,
             )
         })?;

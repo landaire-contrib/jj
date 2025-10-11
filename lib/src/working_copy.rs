@@ -118,7 +118,7 @@ pub trait LockedWorkingCopy: Any {
     ) -> Result<(MergedTreeId, SnapshotStats), SnapshotError>;
 
     /// Check out the specified commit in the working copy.
-    fn check_out(&mut self, commit: &Commit) -> Result<CheckoutStats, CheckoutError>;
+    fn check_out(&mut self, options: &CheckoutOptions) -> Result<CheckoutStats, CheckoutError>;
 
     /// Update the workspace name.
     fn rename_workspace(&mut self, new_workspace_name: WorkspaceNameBuf);
@@ -228,6 +228,20 @@ pub struct SnapshotOptions<'a> {
 
 /// A callback for getting progress updates.
 pub type SnapshotProgress<'a> = dyn Fn(&RepoPath) + 'a + Sync;
+
+/// Options used when updating the working copy. Some of them may be ignored
+/// by some `WorkingCopy` implementations.
+#[derive(Clone)]
+pub struct CheckoutOptions<'a> {
+    /// The commit to update to
+    pub new_commit: &'a Commit,
+
+    /// A callback for the UI to display progress.
+    pub progress: Option<&'a UpdateProgress<'a>>,
+}
+
+/// A callback for getting progress updates.
+pub type UpdateProgress<'a> = dyn Fn(&RepoPath) + 'a + Sync;
 
 /// Stats about a snapshot operation on a working copy.
 #[derive(Clone, Debug, Default)]

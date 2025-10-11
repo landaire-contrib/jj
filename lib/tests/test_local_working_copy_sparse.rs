@@ -19,6 +19,7 @@ use jj_lib::matchers::EverythingMatcher;
 use jj_lib::repo::Repo as _;
 use jj_lib::repo_path::RepoPath;
 use jj_lib::repo_path::RepoPathBuf;
+use jj_lib::working_copy::CheckoutOptions;
 use jj_lib::working_copy::CheckoutStats;
 use jj_lib::working_copy::WorkingCopy as _;
 use pollster::FutureExt as _;
@@ -62,7 +63,14 @@ fn test_sparse_checkout() {
 
     test_workspace
         .workspace
-        .check_out(repo.op_id().clone(), None, &commit)
+        .check_out(
+            repo.op_id().clone(),
+            None,
+            &CheckoutOptions {
+                new_commit: &commit,
+                progress: None,
+            },
+        )
         .unwrap();
     let ws = &mut test_workspace.workspace;
 
@@ -220,7 +228,14 @@ fn test_sparse_commit() {
     let commit = commit_with_tree(repo.store(), tree.id());
     test_workspace
         .workspace
-        .check_out(repo.op_id().clone(), None, &commit)
+        .check_out(
+            repo.op_id().clone(),
+            None,
+            &CheckoutOptions {
+                new_commit: &commit,
+                progress: None,
+            },
+        )
         .unwrap();
 
     // Set sparse patterns to only dir1/

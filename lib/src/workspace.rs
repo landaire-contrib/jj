@@ -25,7 +25,6 @@ use thiserror::Error;
 
 use crate::backend::BackendInitError;
 use crate::backend::MergedTreeId;
-use crate::commit::Commit;
 use crate::file_util;
 use crate::file_util::BadPathEncoding;
 use crate::file_util::IoResultExt as _;
@@ -55,6 +54,7 @@ use crate::signing::Signer;
 use crate::simple_backend::SimpleBackend;
 use crate::transaction::TransactionCommitError;
 use crate::working_copy::CheckoutError;
+use crate::working_copy::CheckoutOptions;
 use crate::working_copy::CheckoutStats;
 use crate::working_copy::LockedWorkingCopy;
 use crate::working_copy::WorkingCopy;
@@ -428,7 +428,7 @@ impl Workspace {
         &mut self,
         operation_id: OperationId,
         old_tree_id: Option<&MergedTreeId>,
-        commit: &Commit,
+        options: &CheckoutOptions,
     ) -> Result<CheckoutStats, CheckoutError> {
         let mut locked_ws = self.start_working_copy_mutation()?;
         // Check if the current working-copy commit has changed on disk compared to what
@@ -440,7 +440,7 @@ impl Workspace {
         {
             return Err(CheckoutError::ConcurrentCheckout);
         }
-        let stats = locked_ws.locked_wc().check_out(commit)?;
+        let stats = locked_ws.locked_wc().check_out(options)?;
         locked_ws
             .finish(operation_id)
             .map_err(|err| CheckoutError::Other {

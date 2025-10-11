@@ -113,6 +113,7 @@ use crate::settings::UserSettings;
 use crate::store::Store;
 use crate::tree::Tree;
 use crate::working_copy::CheckoutError;
+use crate::working_copy::CheckoutOptions;
 use crate::working_copy::CheckoutStats;
 use crate::working_copy::LockedWorkingCopy;
 use crate::working_copy::ResetError;
@@ -121,6 +122,7 @@ use crate::working_copy::SnapshotOptions;
 use crate::working_copy::SnapshotProgress;
 use crate::working_copy::SnapshotStats;
 use crate::working_copy::UntrackedReason;
+use crate::working_copy::UpdateProgress;
 use crate::working_copy::WorkingCopy;
 use crate::working_copy::WorkingCopyFactory;
 use crate::working_copy::WorkingCopyStateError;
@@ -1951,7 +1953,11 @@ impl TreeState {
         Ok(())
     }
 
-    pub fn check_out(&mut self, new_tree: &MergedTree) -> Result<CheckoutStats, CheckoutError> {
+    pub fn check_out<'a>(
+        &mut self,
+        new_tree: &MergedTree,
+        progress: Option<&'a SnapshotProgress<'a>>,
+    ) -> Result<CheckoutStats, CheckoutError> {
         let old_tree = self.current_tree().map_err(|err| match err {
             err @ BackendError::ObjectNotFound { .. } => CheckoutError::SourceNotFound {
                 source: Box::new(err),
@@ -1959,7 +1965,12 @@ impl TreeState {
             other => CheckoutError::InternalBackendError(other),
         })?;
         let stats = self
-            .update(&old_tree, new_tree, self.sparse_matcher().as_ref())
+            .update(
+                &old_tree,
+                new_tree,
+                self.sparse_matcher().as_ref(),
+                progress,
+            )
             .block_on()?;
         self.tree_id = new_tree.id();
         Ok(stats)
@@ -1980,9 +1991,11 @@ impl TreeState {
         let added_matcher = DifferenceMatcher::new(&new_matcher, &old_matcher);
         let removed_matcher = DifferenceMatcher::new(&old_matcher, &new_matcher);
         let empty_tree = MergedTree::resolved(Tree::empty(self.store.clone(), RepoPathBuf::root()));
-        let added_stats = self.update(&empty_tree, &tree, &added_matcher).block_on()?;
+        let added_stats = self
+            .update(&empty_tree, &tree, &added_matcher, None)
+            .block_on()?;
         let removed_stats = self
-            .update(&tree, &empty_tree, &removed_matcher)
+            .update(&tree, &empty_tree, &removed_matcher, None)
             .block_on()?;
         self.sparse_patterns = sparse_patterns;
         assert_eq!(added_stats.updated_files, 0);
@@ -1998,11 +2011,12 @@ impl TreeState {
         })
     }
 
-    async fn update(
+    async fn update<'a>(
         &mut self,
         old_tree: &MergedTree,
         new_tree: &MergedTree,
         matcher: &dyn Matcher,
+        progress: Option<&'a UpdateProgress<'a>>,
     ) -> Result<CheckoutStats, CheckoutError> {
         // TODO: maybe it's better not include the skipped counts in the "intended"
         // counts
@@ -2030,6 +2044,10 @@ impl TreeState {
         let mut reserved_path_cache = HashSet::new();
 
         while let Some((path, data)) = diff_stream.next().await {
+            if let Some(progress) = progress {
+                (progress)(&path);
+            }
+
             let (before, after) = data?;
             if after.is_absent() {
                 stats.removed_files += 1;
@@ -2639,13 +2657,13 @@ impl LockedWorkingCopy for LockedLocalWorkingCopy {
         Ok((tree_state.current_tree_id().clone(), stats))
     }
 
-    fn check_out(&mut self, commit: &Commit) -> Result<CheckoutStats, CheckoutError> {
+    fn check_out(&mut self, options: &CheckoutOptions) -> Result<CheckoutStats, CheckoutError> {
         // TODO: Write a "pending_checkout" file with the new TreeId so we can
         // continue an interrupted update if we find such a file.
-        let new_tree = commit.tree()?;
+        let new_tree = options.new_commit.tree()?;
         let tree_state = self.wc.tree_state_mut()?;
-        if tree_state.tree_id != *commit.tree_id() {
-            let stats = tree_state.check_out(&new_tree)?;
+        if tree_state.tree_id != *options.new_commit.tree_id() {
+            let stats = tree_state.check_out(&new_tree, options.progress)?;
             self.tree_state_dirty = true;
             Ok(stats)
         } else {

@@ -156,7 +156,7 @@ pub(crate) fn check_out_trees(
         };
         let mut state = TreeState::init(store.clone(), wc_path, state_dir, &tree_state_settings)?;
         state.set_sparse_patterns(changed_files.clone())?;
-        state.check_out(tree)?;
+        state.check_out(tree, None)?;
         Ok(state)
     };
 

@@ -64,3 +64,53 @@ pub fn snapshot_progress(ui: &Ui) -> Option<impl Fn(&RepoPath) + use<>> {
         _ = state.output.flush();
     })
 }
+
+pub fn update_progress(ui: &Ui) -> Option<impl Fn(&RepoPath) + use<>> {
+    struct State {
+        guard: Option<OutputGuard>,
+        output: ProgressOutput<std::io::Stderr>,
+        next_display_time: Instant,
+    }
+
+    let output = ui.progress_output()?;
+
+    // Don't clutter the output during fast operations.
+    let next_display_time = Instant::now() + INITIAL_DELAY;
+    let state = Mutex::new(State {
+        guard: None,
+        output,
+        next_display_time,
+    });
+
+    Some(move |path: &RepoPath| {
+        let mut state = state.lock().unwrap();
+        let now = Instant::now();
+        if now < state.next_display_time {
+            // Future work: Display current path after exactly, say, 250ms has elapsed, to
+            // better handle large single files
+            return;
+        }
+        state.next_display_time = now + Duration::from_secs(1) / UPDATE_HZ;
+
+        if state.guard.is_none() {
+            state.guard = Some(
+                state
+                    .output
+                    .output_guard(format!("\r{}", Clear(ClearType::CurrentLine))),
+            );
+        }
+
+        let line_width = state.output.term_width().map(usize::from).unwrap_or(80);
+        let max_path_width = line_width.saturating_sub(9); // Account for "Updating "
+        let fs_path = path.to_fs_path_unchecked(Path::new(""));
+        let (display_path, _) =
+            text_util::elide_start(fs_path.to_str().unwrap(), "...", max_path_width);
+
+        _ = write!(
+            state.output,
+            "\r{}Updating {display_path}",
+            Clear(ClearType::CurrentLine),
+        );
+        _ = state.output.flush();
+    })
+}
